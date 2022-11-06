@@ -16,6 +16,7 @@
 #include "mesh-pb-constants.h"
 #include <pb_decode.h>
 #include <pb_encode.h>
+#include <ErriezCRC32.h>
 
 #ifdef ARCH_ESP32
 #include "mesh/http/WiFiAPClient.h"
@@ -37,6 +38,7 @@ MyNodeInfo &myNodeInfo = devicestate.my_node;
 LocalConfig config;
 LocalModuleConfig moduleConfig;
 ChannelFile channelFile;
+OEMStore oemStore;
 
 /** The current change # for radio settings.  Starts at 0 on boot and any time the radio settings
  * might have changed is incremented.  Allows others to detect they might now be on a new channel.
@@ -128,7 +130,9 @@ bool NodeDB::factoryReset()
     // second, install default state (this will deal with the duplicate mac address issue)
     installDefaultDeviceState();
     installDefaultConfig();
-    // third, write to disk
+    installDefaultModuleConfig();
+    installDefaultChannels();
+    // third, write everything to disk
     saveToDisk();
 #ifdef ARCH_ESP32
     // This will erase what's in NVS including ssl keys, persistant variables and ble pairing
@@ -268,6 +272,12 @@ void NodeDB::init()
     DEBUG_MSG("Initializing NodeDB\n");
     loadFromDisk();
 
+    uint32_t devicestateCRC = crc32Buffer(&devicestate, sizeof(devicestate));
+    uint32_t configCRC = crc32Buffer(&config, sizeof(config));
+    uint32_t channelFileCRC = crc32Buffer(&channelFile, sizeof(channelFile));
+
+    int saveWhat = 0;
+
     myNodeInfo.max_channels = MAX_NUM_CHANNELS; // tell others the max # of channels we can understand
 
     myNodeInfo.error_code = CriticalErrorCode_NONE; // For the error code, only show values from this boot (discard value from flash)
@@ -305,7 +315,15 @@ void NodeDB::init()
 
     resetRadioConfig(); // If bogus settings got saved, then fix them
     DEBUG_MSG("region=%d, NODENUM=0x%x, dbsize=%d\n", config.lora.region, myNodeInfo.my_node_num, *numNodes);
-    saveToDisk();
+
+    if (devicestateCRC != crc32Buffer(&devicestate, sizeof(devicestate)))
+        saveWhat |= SEGMENT_DEVICESTATE;
+    if (configCRC != crc32Buffer(&config, sizeof(config)))
+        saveWhat |= SEGMENT_CONFIG;
+    if (channelFileCRC != crc32Buffer(&channelFile, sizeof(channelFile)))
+        saveWhat |= SEGMENT_CHANNELS;
+
+    saveToDisk(saveWhat);
 }
 
 // We reserve a few nodenums for future use
@@ -339,6 +357,8 @@ static const char *prefFileName = "/prefs/db.proto";
 static const char *configFileName = "/prefs/config.proto";
 static const char *moduleConfigFileName = "/prefs/module.proto";
 static const char *channelFileName = "/prefs/channels.proto";
+static const char *oemConfigFile = "/oem/oem.proto";
+
 
 /** Load a protobuf from a file, return true for success */
 bool loadProto(const char *filename, size_t protoSize, size_t objSize, const pb_msgdesc_t *fields, void *dest_struct)
@@ -418,6 +438,9 @@ void NodeDB::loadFromDisk()
             DEBUG_MSG("Loaded saved channelFile version %d\n", channelFile.version);
         }
     }
+
+    if (loadProto(oemConfigFile, OEMStore_size, sizeof(OEMStore), OEMStore_fields, &oemStore))
+        DEBUG_MSG("Loaded OEMStore\n");
 }
 
 /** Save a protobuf from a file, return true for success */
@@ -474,34 +497,41 @@ void NodeDB::saveDeviceStateToDisk()
     }
 }
 
-void NodeDB::saveToDisk()
+void NodeDB::saveToDisk(int saveWhat)
 {
     if (!devicestate.no_save) {
 #ifdef FSCom
         FSCom.mkdir("/prefs");
 #endif
-        saveProto(prefFileName, DeviceState_size, sizeof(devicestate), DeviceState_fields, &devicestate);
+        if (saveWhat & SEGMENT_DEVICESTATE) {
+            saveDeviceStateToDisk();
+        }
 
-        // save all config segments
-        config.has_device = true;
-        config.has_display = true;
-        config.has_lora = true;
-        config.has_position = true;
-        config.has_power = true;
-        config.has_network = true;
-        config.has_bluetooth = true;
-        saveProto(configFileName, LocalConfig_size, sizeof(config), LocalConfig_fields, &config);
+        if (saveWhat & SEGMENT_CONFIG) {
+            config.has_device = true;
+            config.has_display = true;
+            config.has_lora = true;
+            config.has_position = true;
+            config.has_power = true;
+            config.has_network = true;
+            config.has_bluetooth = true;
+            saveProto(configFileName, LocalConfig_size, sizeof(config), LocalConfig_fields, &config);
+        }
 
-        moduleConfig.has_canned_message = true;
-        moduleConfig.has_external_notification = true;
-        moduleConfig.has_mqtt = true;
-        moduleConfig.has_range_test = true;
-        moduleConfig.has_serial = true;
-        moduleConfig.has_store_forward = true;
-        moduleConfig.has_telemetry = true;
-        saveProto(moduleConfigFileName, LocalModuleConfig_size, sizeof(moduleConfig), LocalModuleConfig_fields, &moduleConfig);
+        if (saveWhat & SEGMENT_MODULECONFIG) {
+            moduleConfig.has_canned_message = true;
+            moduleConfig.has_external_notification = true;
+            moduleConfig.has_mqtt = true;
+            moduleConfig.has_range_test = true;
+            moduleConfig.has_serial = true;
+            moduleConfig.has_store_forward = true;
+            moduleConfig.has_telemetry = true;
+            saveProto(moduleConfigFileName, LocalModuleConfig_size, sizeof(moduleConfig), LocalModuleConfig_fields, &moduleConfig);
+        }
 
-        saveChannelsToDisk();
+        if (saveWhat & SEGMENT_CHANNELS) {
+            saveChannelsToDisk();
+        }
     } else {
         DEBUG_MSG("***** DEVELOPMENT MODE - DO NOT RELEASE - not saving to flash *****\n");
     }
@@ -677,11 +707,23 @@ NodeInfo *NodeDB::getOrCreateNode(NodeNum n)
 
     if (!info) {
         if (*numNodes >= MAX_NUM_NODES) {
-            screen->print("error: node_db full!\n");
-            DEBUG_MSG("ERROR! could not create new node, node_db is full! (%d nodes)", *numNodes);
-            return NULL;
+            screen->print("warning: node_db full! erasing oldest entry\n");
+            // look for oldest node and erase it
+            uint32_t oldest = UINT32_MAX;
+            int oldestIndex = -1;
+            for (int i = 0; i < *numNodes; i++) {
+                if (nodes[i].last_heard < oldest) {
+                    oldest = nodes[i].last_heard;
+                    oldestIndex = i;
+                }
+            }
+            // Shove the remaining nodes down the chain
+            for (int i = oldestIndex; i < *numNodes - 1; i++) {
+                nodes[i] = nodes[i + 1];
+            }
+            (*numNodes)--;
         }
-        // add the node
+        // add the node at the end
         info = &nodes[(*numNodes)++];
 
         // everything is missing except the nodenum

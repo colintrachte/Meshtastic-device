@@ -2,6 +2,7 @@
 #include "MeshService.h"
 #include "NodeDB.h"
 #include "RTC.h"
+#include "NMEAWPL.h"
 #include "Router.h"
 #include "configuration.h"
 #include <Arduino.h>
@@ -27,8 +28,7 @@
                 TXD 15
         3) Set timeout to the amount of time to wait before we consider
            your packet as "done".
-        4) (Optional) In SerialModule.h set the port to PortNum_TEXT_MESSAGE_APP if you want to
-           send messages to/from the general text message channel.
+        4) not applicable any more
         5) Connect to your device over the serial interface at 38400 8N1.
         6) Send a packet up to 240 bytes in length. This will get relayed over the mesh network.
         7) (Optional) Set echo to 1 and any message you send out will be echoed back
@@ -41,7 +41,7 @@
     KNOWN PROBLEMS
         * Until the module is initilized by the startup sequence, the TX pin is in a floating
           state. Device connected to that pin may see this as "noise".
-        * Will not work on NRF and the Linux device targets.
+        * Will not work on T-Echo and the Linux device targets.
 
 
 */
@@ -61,10 +61,23 @@ SerialModule::SerialModule() : concurrency::OSThread("SerialModule") {}
 
 char serialStringChar[Constants_DATA_PAYLOAD_LEN];
 
-SerialModuleRadio::SerialModuleRadio() : SinglePortModule("SerialModuleRadio", PortNum_SERIAL_APP)
+SerialModuleRadio::SerialModuleRadio() : MeshModule("SerialModuleRadio")
 {
-    // restrict to the admin channel for rx
-    boundChannel = Channels::serialChannel;
+
+    switch (moduleConfig.serial.mode)
+    {
+        case ModuleConfig_SerialConfig_Serial_Mode_TEXTMSG:
+            ourPortNum = PortNum_TEXT_MESSAGE_APP;
+            break;
+        case ModuleConfig_SerialConfig_Serial_Mode_NMEA:
+            ourPortNum = PortNum_POSITION_APP;
+            break;
+        default:
+            ourPortNum = PortNum_SERIAL_APP;
+            // restrict to the serial channel for rx
+            boundChannel = Channels::serialChannel;
+            break;
+    }
 }
 
 int32_t SerialModule::runOnce()
@@ -139,7 +152,9 @@ int32_t SerialModule::runOnce()
                 baud = 921600;
             }
 
-#ifdef ARCH_ESP32
+#ifdef ARCH_ESP32 
+            Serial2.setRxBufferSize(RX_BUFFER);
+
             if (moduleConfig.serial.rxd && moduleConfig.serial.txd) {
                 Serial2.begin(baud, SERIAL_8N1, moduleConfig.serial.rxd, moduleConfig.serial.txd);
 
@@ -159,24 +174,30 @@ int32_t SerialModule::runOnce()
                 Serial2.setTimeout(TIMEOUT); // Number of MS to wait to set the timeout for the string.
             }
 
-#ifdef ARCH_ESP32 
-            Serial2.setRxBufferSize(RX_BUFFER);
-#endif
-
             serialModuleRadio = new SerialModuleRadio();
 
             firstTime = 0;
 
         } else {
-            String serialString;
 
-            while (Serial2.available()) {
-                serialString = Serial2.readString();
-                serialString.toCharArray(serialStringChar, Constants_DATA_PAYLOAD_LEN);
+            // in NMEA mode send out GGA every 2 seconds, Don't read from Port
+            if (moduleConfig.serial.mode == ModuleConfig_SerialConfig_Serial_Mode_NMEA) {
+                if (millis() - lastNmeaTime > 2000) {
+                    lastNmeaTime = millis();
+                    printGGA(outbuf, nodeDB.getNode(myNodeInfo.my_node_num)->position);
+                    Serial2.printf("%s", outbuf);
+                }
+            } else {
+                String serialString;
 
-                serialModuleRadio->sendPayload();
+                while (Serial2.available()) {
+                    serialString = Serial2.readString();
+                    serialString.toCharArray(serialStringChar, Constants_DATA_PAYLOAD_LEN);
 
-                DEBUG_MSG("Received: %s\n", serialStringChar);
+                    serialModuleRadio->sendPayload();
+
+                    DEBUG_MSG("Received: %s\n", serialStringChar);
+                }
             }
         }
 
@@ -184,7 +205,7 @@ int32_t SerialModule::runOnce()
     } else {
         DEBUG_MSG("Serial Module Disabled\n");
 
-        return (INT32_MAX);
+        return INT32_MAX;
     }
 #else
     return INT32_MAX;
@@ -244,12 +265,23 @@ ProcessMessage SerialModuleRadio::handleReceived(const MeshPacket &mp)
 
             if (moduleConfig.serial.mode == ModuleConfig_SerialConfig_Serial_Mode_DEFAULT ||
                 moduleConfig.serial.mode == ModuleConfig_SerialConfig_Serial_Mode_SIMPLE) {
-                // DEBUG_MSG("* * Message came from the mesh\n");
-                // Serial2.println("* * Message came from the mesh");
                 Serial2.printf("%s", p.payload.bytes);
 
             } else if (moduleConfig.serial.mode == ModuleConfig_SerialConfig_Serial_Mode_PROTO) {
                 // TODO this needs to be implemented
+            } else if (moduleConfig.serial.mode == ModuleConfig_SerialConfig_Serial_Mode_NMEA) {
+                // Decode the Payload some more
+                Position scratch;
+                Position *decoded = NULL;
+                if (mp.which_payload_variant == MeshPacket_decoded_tag && mp.decoded.portnum == ourPortNum) {
+                    memset(&scratch, 0, sizeof(scratch));
+                    if (pb_decode_from_bytes(p.payload.bytes, p.payload.size, Position_fields, &scratch)) {
+                        decoded = &scratch;
+                    }
+                    // send position packet as WPL to the serial port
+                    printWPL(outbuf, *decoded, nodeDB.getNode(getFrom(&mp))->user.long_name);
+                    Serial2.printf("%s", outbuf);
+                }
             }
         }
 

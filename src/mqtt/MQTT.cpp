@@ -8,15 +8,17 @@
 #include "mesh/generated/mqtt.pb.h"
 #include "mesh/generated/telemetry.pb.h"
 #include "sleep.h"
+#if HAS_WIFI
 #include <WiFi.h>
+#endif
 #include <assert.h>
 #include <json11.hpp>
 
 MQTT *mqtt;
 
-String statusTopic = "msh/1/stat/";
-String cryptTopic = "msh/1/c/";   // msh/1/c/CHANNELID/NODEID
-String jsonTopic = "msh/1/json/"; // msh/1/json/CHANNELID/NODEID
+String statusTopic = "msh/2/stat/";
+String cryptTopic = "msh/2/c/";   // msh/2/c/CHANNELID/NODEID
+String jsonTopic = "msh/2/json/"; // msh/2/json/CHANNELID/NODEID
 
 void MQTT::mqttCallback(char *topic, byte *payload, unsigned int length)
 {
@@ -27,8 +29,9 @@ void MQTT::onPublish(char *topic, byte *payload, unsigned int length)
 {
     // parsing ServiceEnvelope
     ServiceEnvelope e = ServiceEnvelope_init_default;
-    if (!pb_decode_from_bytes(payload, length, ServiceEnvelope_fields, &e) && moduleConfig.mqtt.json_enabled) {
-        // check if this is a json payload message
+
+    if (moduleConfig.mqtt.json_enabled && (strncmp(topic, jsonTopic.c_str(), jsonTopic.length()) == 0)) {
+        // check if this is a json payload message by comparing the topic start
         using namespace json11;
         char payloadStr[length + 1];
         memcpy(payloadStr, payload, length);
@@ -36,36 +39,37 @@ void MQTT::onPublish(char *topic, byte *payload, unsigned int length)
         std::string err;
         auto json = Json::parse(payloadStr, err);
         if (err.empty()) {
-            DEBUG_MSG("Received json payload on MQTT, parsing..\n");
+            DEBUG_MSG("JSON Received on MQTT, parsing..\n");
             // check if it is a valid envelope
-            if (json.object_items().count("sender") != 0 && json.object_items().count("payload") != 0) {
+            if (json.object_items().count("sender") != 0 && json.object_items().count("payload") != 0 && json["type"].string_value().compare("sendtext") == 0) {
                 // this is a valid envelope
                 if (json["sender"].string_value().compare(owner.id) != 0) {
                     std::string jsonPayloadStr = json["payload"].dump();
-                    DEBUG_MSG("Received json payload %s, length %u\n", jsonPayloadStr.c_str(), jsonPayloadStr.length());
-                    // FIXME Not sure we need to be doing this
+                    DEBUG_MSG("JSON payload %s, length %u\n", jsonPayloadStr.c_str(), jsonPayloadStr.length());
+
                     // construct protobuf data packet using TEXT_MESSAGE, send it to the mesh
-                    // MeshPacket *p = router->allocForSending();
-                    // p->decoded.portnum = PortNum_TEXT_MESSAGE_APP;
-                    // if (jsonPayloadStr.length() <= sizeof(p->decoded.payload.bytes)) {
-                    //     memcpy(p->decoded.payload.bytes, jsonPayloadStr.c_str(), jsonPayloadStr.length());
-                    //     p->decoded.payload.size = jsonPayloadStr.length();
-                    //     MeshPacket *packet = packetPool.allocCopy(*p);
-                    //     service.sendToMesh(packet, RX_SRC_LOCAL);
-                    // } else {
-                    //     DEBUG_MSG("Received MQTT json payload too long, dropping\n");
-                    // }
+                    MeshPacket *p = router->allocForSending();
+                    p->decoded.portnum = PortNum_TEXT_MESSAGE_APP;
+                    if (jsonPayloadStr.length() <= sizeof(p->decoded.payload.bytes)) {
+                        memcpy(p->decoded.payload.bytes, jsonPayloadStr.c_str(), jsonPayloadStr.length());
+                        p->decoded.payload.size = jsonPayloadStr.length();
+                        MeshPacket *packet = packetPool.allocCopy(*p);
+                        service.sendToMesh(packet, RX_SRC_LOCAL);
+                    } else {
+                        DEBUG_MSG("Received MQTT json payload too long, dropping\n");
+                    }
                 } else {
-                    DEBUG_MSG("Ignoring downlink message we originally sent.\n");
+                    DEBUG_MSG("JSON Ignoring downlink message we originally sent.\n");
                 }
             } else {
-                DEBUG_MSG("Received json payload on MQTT but not a valid envelope\n");
+                DEBUG_MSG("JSON Received payload on MQTT but not a valid envelope\n");
             }
         } else {
             // no json, this is an invalid payload
             DEBUG_MSG("Invalid MQTT service envelope, topic %s, len %u!\n", topic, length);
         }
     } else {
+        pb_decode_from_bytes(payload, length, ServiceEnvelope_fields, &e);
         if (strcmp(e.gateway_id, owner.id) == 0)
             DEBUG_MSG("Ignoring downlink message we originally sent.\n");
         else {
@@ -101,6 +105,11 @@ MQTT::MQTT() : concurrency::OSThread("mqtt"), pubSub(mqttClient)
     pubSub.setCallback(mqttCallback);
 
     // preflightSleepObserver.observe(&preflightSleep);
+}
+
+bool MQTT::connected()
+{
+    return pubSub.connected();
 }
 
 void MQTT::reconnect()
@@ -187,7 +196,13 @@ bool MQTT::wantsLink() const
         }
     }
 
+#if HAS_WIFI
     return hasChannel && WiFi.isConnected();
+#endif
+#if HAS_ETHERNET
+    return hasChannel && (Ethernet.linkStatus() == LinkON);
+#endif
+    return false;
 }
 
 int32_t MQTT::runOnce()
@@ -243,7 +258,7 @@ void MQTT::onSend(const MeshPacket &mp, ChannelIndex chIndex)
             auto jsonString = this->downstreamPacketToJson((MeshPacket *)&mp);
             if (jsonString.length() != 0) {
                 String topicJson = jsonTopic + channelId + "/" + owner.id;
-                DEBUG_MSG("publish json message to %s, %u bytes: %s\n", topicJson.c_str(), jsonString.length(), jsonString.c_str());
+                DEBUG_MSG("JSON publish message to %s, %u bytes: %s\n", topicJson.c_str(), jsonString.length(), jsonString.c_str());
                 pubSub.publish(topicJson.c_str(), jsonString.c_str(), false);
             }
         }
@@ -251,7 +266,7 @@ void MQTT::onSend(const MeshPacket &mp, ChannelIndex chIndex)
 }
 
 // converts a downstream packet into a json message
-String MQTT::downstreamPacketToJson(MeshPacket *mp)
+std::string MQTT::downstreamPacketToJson(MeshPacket *mp)
 {
     using namespace json11;
 
@@ -279,7 +294,7 @@ String MQTT::downstreamPacketToJson(MeshPacket *mp)
             // if it isn't, then we need to create a json object
             // with the string as the value
             DEBUG_MSG("text message payload is of type plaintext\n");
-            msgPayload = Json::object({{"text", payloadStr}});
+            msgPayload = Json::object{{"text", payloadStr}};
         }
         break;
     }
@@ -344,9 +359,9 @@ String MQTT::downstreamPacketToJson(MeshPacket *mp)
                 msgPayload = Json::object{
                     {"time", (int)decoded->time},
                     {"pos_timestamp", (int)decoded->timestamp},
-                    {"latitude_i", decoded->latitude_i}, 
-                    {"longitude_i", decoded->longitude_i}, 
-                    {"altitude", decoded->altitude}
+                    {"latitude_i", (int)decoded->latitude_i}, 
+                    {"longitude_i", (int)decoded->longitude_i}, 
+                    {"altitude", (int)decoded->altitude}
                 };
             } else {
                 DEBUG_MSG("Error decoding protobuf for position message!\n");
@@ -369,8 +384,8 @@ String MQTT::downstreamPacketToJson(MeshPacket *mp)
                     {"description", decoded->description},
                     {"expire", (int)decoded->expire},
                     {"locked", decoded->locked},
-                    {"latitude_i", decoded->latitude_i}, 
-                    {"longitude_i", decoded->longitude_i}, 
+                    {"latitude_i", (int)decoded->latitude_i}, 
+                    {"longitude_i", (int)decoded->longitude_i}, 
                 };
             } else {
                 DEBUG_MSG("Error decoding protobuf for position message!\n");
@@ -396,8 +411,8 @@ String MQTT::downstreamPacketToJson(MeshPacket *mp)
     };
 
     // serialize and return it
-    static std::string jsonStr = jsonObj.dump();
+    std::string jsonStr = jsonObj.dump();
     DEBUG_MSG("serialized json message: %s\n", jsonStr.c_str());
 
-    return jsonStr.c_str();
+    return jsonStr;
 }

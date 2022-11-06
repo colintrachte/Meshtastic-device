@@ -94,10 +94,6 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 // Define this if you know you have that controller or your "SSD1306" misbehaves.
 //#define USE_SH1106
 
-// Flip the screen upside down by default as it makes more sense on T-BEAM
-// devices. Comment this out to not rotate screen 180 degrees.
-#define SCREEN_FLIP_VERTICALLY
-
 // Define if screen should be mirrored left to right
 // #define SCREEN_MIRROR
 
@@ -112,6 +108,17 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #define MCP9808_ADDR 0x18
 #define INA_ADDR 0x40
 #define INA_ADDR_ALTERNATE 0x41
+#define QMC6310_ADDR 0x1C
+#define QMI8658_ADDR 0x6B
+#define SHTC3_ADDR 0x70
+#define LPS22HB_ADDR 0x5C
+#define LPS22HB_ADDR_ALT 0x5D
+
+// -----------------------------------------------------------------------------
+// Security
+// -----------------------------------------------------------------------------
+
+#define ATECC608B_ADDR 0x35
 
 // -----------------------------------------------------------------------------
 // GPS
@@ -135,6 +142,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #ifndef HAS_WIFI
     #define HAS_WIFI 0
 #endif
+#ifndef HAS_ETHERNET
+    #define HAS_ETHERNET 0
+#endif
 #ifndef HAS_SCREEN
     #define HAS_SCREEN 0
 #endif
@@ -155,6 +165,12 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #endif
 #ifndef HAS_RTC
     #define HAS_RTC 0
+#endif
+#ifndef HAS_CPU_SHUTDOWN
+    #define HAS_CPU_SHUTDOWN 0
+#endif
+#ifndef HAS_BLUETOOTH
+    #define HAS_BLUETOOTH 0
 #endif
 
 #include "RF95Configuration.h"

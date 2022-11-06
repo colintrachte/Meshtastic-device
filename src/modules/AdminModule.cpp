@@ -2,6 +2,9 @@
 #include "Channels.h"
 #include "MeshService.h"
 #include "NodeDB.h"
+#ifdef ARCH_ESP32
+#include "BleOta.h"
+#endif
 #include "Router.h"
 #include "configuration.h"
 #include "main.h"
@@ -98,8 +101,21 @@ bool AdminModule::handleReceivedProtobuf(const MeshPacket &mp, AdminMessage *r)
      * Other
      */
     case AdminMessage_reboot_seconds_tag: {
-        int32_t s = r->reboot_seconds;
-        DEBUG_MSG("Rebooting in %d seconds\n", s);
+        reboot(r->reboot_seconds);
+        break;
+    }
+    case AdminMessage_reboot_ota_seconds_tag: {
+        int32_t s = r->reboot_ota_seconds;
+#ifdef ARCH_ESP32        
+        if (BleOta::getOtaAppVersion().isEmpty()) {
+            DEBUG_MSG("No OTA firmware available, scheduling regular reboot in %d seconds\n", s);
+        }else{
+            BleOta::switchToOtaApp();
+            DEBUG_MSG("Rebooting to OTA in %d seconds\n", s);
+        }
+#else
+        DEBUG_MSG("Not on ESP32, scheduling regular reboot in %d seconds\n", s);
+#endif
         rebootAtMsec = (s < 0) ? 0 : (millis() + s * 1000);
         break;
     }
@@ -117,13 +133,13 @@ bool AdminModule::handleReceivedProtobuf(const MeshPacket &mp, AdminMessage *r)
     case AdminMessage_factory_reset_tag: {
         DEBUG_MSG("Initiating factory reset\n");
         nodeDB.factoryReset();
-        rebootAtMsec = millis() + (5 * 1000);
+        reboot(5);
         break;
     }
     case AdminMessage_nodedb_reset_tag: {
         DEBUG_MSG("Initiating node-db reset\n");
         nodeDB.resetNodes();
-        rebootAtMsec = millis() + (5 * 1000);
+        reboot(5);
         break;
     }
 #ifdef ARCH_PORTDUINO
@@ -178,14 +194,12 @@ void AdminModule::handleSetOwner(const User &o)
     if (changed) { // If nothing really changed, don't broadcast on the network or write to flash
         service.reloadOwner();
         DEBUG_MSG("Rebooting due to owner changes\n");
-        screen->startRebootScreen();
-        rebootAtMsec = millis() + (5 * 1000);
+        reboot(5);
     }
 }
 
 void AdminModule::handleSetConfig(const Config &c)
 {
-    bool requiresReboot = false;
     bool isRouter = (config.device.role == Config_DeviceConfig_Role_ROUTER);
     bool isRegionUnset = (config.lora.region == Config_LoRaConfig_RegionCode_UNSET);
 
@@ -200,12 +214,13 @@ void AdminModule::handleSetConfig(const Config &c)
                 nodeDB.initConfigIntervals();
                 nodeDB.initModuleConfigIntervals();
             }
-            requiresReboot = true;
             break;
         case Config_position_tag:
             DEBUG_MSG("Setting config: Position\n");
             config.has_position = true;
             config.position = c.payload_variant.position;
+            // Save nodedb as well in case we got a fixed position packet
+            nodeDB.saveToDisk(SEGMENT_DEVICESTATE);
             break;
         case Config_power_tag:
             DEBUG_MSG("Setting config: Power\n");
@@ -216,7 +231,6 @@ void AdminModule::handleSetConfig(const Config &c)
             DEBUG_MSG("Setting config: WiFi\n");
             config.has_network = true;
             config.network = c.payload_variant.network;
-            requiresReboot = true;
             break;
         case Config_display_tag:
             DEBUG_MSG("Setting config: Display\n");
@@ -231,23 +245,16 @@ void AdminModule::handleSetConfig(const Config &c)
                 config.lora.region > Config_LoRaConfig_RegionCode_UNSET) {
                 config.lora.tx_enabled = true;
             }
-            requiresReboot = true;
             break;
         case Config_bluetooth_tag:
             DEBUG_MSG("Setting config: Bluetooth\n");
             config.has_bluetooth = true;
             config.bluetooth = c.payload_variant.bluetooth;
-            requiresReboot = true;
             break;
     }
 
-    service.reloadConfig();
-    // Reboot 5 seconds after a config that requires rebooting is set
-    if (requiresReboot) {
-        DEBUG_MSG("Rebooting due to config changes\n");
-        screen->startRebootScreen();
-        rebootAtMsec = millis() + (5 * 1000);
-    }
+    service.reloadConfig(SEGMENT_CONFIG);
+    reboot(5);
 }
 
 void AdminModule::handleSetModuleConfig(const ModuleConfig &c)
@@ -289,8 +296,9 @@ void AdminModule::handleSetModuleConfig(const ModuleConfig &c)
             moduleConfig.canned_message = c.payload_variant.canned_message;
             break;
     }
-
-    service.reloadConfig();
+    
+    service.reloadConfig(SEGMENT_MODULECONFIG);
+    reboot(5);
 }
 
 void AdminModule::handleSetChannel(const Channel &cc)
@@ -433,6 +441,10 @@ void AdminModule::handleGetDeviceMetadata(const MeshPacket &req) {
     DeviceMetadata deviceMetadata;
     strncpy(deviceMetadata.firmware_version, myNodeInfo.firmware_version, 18);
     deviceMetadata.device_state_version = DEVICESTATE_CUR_VER;
+    deviceMetadata.canShutdown = pmu_found || HAS_CPU_SHUTDOWN;
+    deviceMetadata.hasBluetooth = HAS_BLUETOOTH;
+    deviceMetadata.hasWifi = HAS_WIFI;
+    deviceMetadata.hasEthernet = HAS_ETHERNET;
 
     r.get_device_metadata_response = deviceMetadata;
     r.which_payload_variant = AdminMessage_get_device_metadata_response_tag;
@@ -448,6 +460,13 @@ void AdminModule::handleGetChannel(const MeshPacket &req, uint32_t channelIndex)
         r.which_payload_variant = AdminMessage_get_channel_response_tag;
         myReply = allocDataProtobuf(r);
     }
+}
+
+void AdminModule::reboot(int32_t seconds) 
+{
+    DEBUG_MSG("Rebooting in %d seconds\n", seconds);
+    screen->startRebootScreen();
+    rebootAtMsec = (seconds < 0) ? 0 : (millis() + seconds * 1000);
 }
 
 AdminModule::AdminModule() : ProtobufModule("Admin", PortNum_ADMIN_APP, AdminMessage_fields)

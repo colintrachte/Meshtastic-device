@@ -5,7 +5,12 @@
 #include "concurrency/OSThread.h"
 #include "mesh/Channels.h"
 #include <PubSubClient.h>
+#if HAS_WIFI
 #include <WiFiClient.h>
+#endif
+#if HAS_ETHERNET
+#include <EthernetClient.h>
+#endif
 
 /**
  * Our wrapper/singleton for sending/receiving MQTT "udp" packets.  This object isolates the MQTT protocol implementation from
@@ -16,7 +21,12 @@ class MQTT : private concurrency::OSThread
     // supposedly the current version is busted:
     // http://www.iotsharing.com/2017/08/how-to-use-esp32-mqtts-with-mqtts-mosquitto-broker-tls-ssl.html
     // WiFiClientSecure wifiClient;
+#if HAS_WIFI
     WiFiClient mqttClient;
+#endif
+#if HAS_ETHERNET
+    EthernetClient mqttClient;
+#endif
     PubSubClient pubSub;
 
     // instead we supress sleep from our runOnce() callback
@@ -38,6 +48,8 @@ class MQTT : private concurrency::OSThread
     /** Attempt to connect to server if necessary
      */
     void reconnect();
+
+    bool connected();
     
   protected:
     virtual int32_t runOnce() override;
@@ -58,7 +70,7 @@ class MQTT : private concurrency::OSThread
     void onPublish(char *topic, byte *payload, unsigned int length);
 
     /// Called when a new publish arrives from the MQTT server
-    String downstreamPacketToJson(MeshPacket *mp);
+    std::string downstreamPacketToJson(MeshPacket *mp);
 
     /// Return 0 if sleep is okay, veto sleep if we are connected to pubsub server
     // int preflightSleepCb(void *unused = NULL) { return pubSub.connected() ? 1 : 0; }    

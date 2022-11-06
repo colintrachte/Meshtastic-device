@@ -233,11 +233,14 @@ bool Power::setup()
 
 void Power::shutdown()
 {
-
+    screen->setOn(false);
+#if defined(USE_EINK) && defined(PIN_EINK_EN)
+    digitalWrite(PIN_EINK_EN, LOW); //power off backlight first
+#endif
 
 #ifdef HAS_PMU
     DEBUG_MSG("Shutting down\n");
-    if(PMU){
+    if(PMU) {
         PMU->setChargingLedMode(XPOWERS_CHG_LED_OFF);
         PMU->shutdown();
     }
@@ -312,7 +315,7 @@ int32_t Power::runOnce()
 #ifdef HAS_PMU
     // WE no longer use the IRQ line to wake the CPU (due to false wakes from sleep), but we do poll
     // the IRQ status by reading the registers over I2C
-    if(PMU){
+    if(PMU) {
 
         PMU->getIrqStatus();
 
@@ -341,10 +344,11 @@ int32_t Power::runOnce()
         if (PMU->isBatRemoveIrq()) {
             DEBUG_MSG("Battery removed\n");
         }
-        if (PMU->isPekeyShortPressIrq()) {
-            DEBUG_MSG("PEK short button press\n");
-        }
         */
+        if (PMU->isPekeyLongPressIrq()) {
+            DEBUG_MSG("PEK long button press\n");
+            screen->setOn(false);
+        }
 
         PMU->clearIrqStatus();
     }
@@ -368,8 +372,21 @@ bool Power::axpChipInit()
 
 #ifdef HAS_PMU
 
+        TwoWire * w = NULL;
+
+    // Use macro to distinguish which wire is used by PMU
+#ifdef PMU_USE_WIRE1
+        w = &Wire1;
+#else
+        w = &Wire;
+#endif
+
+    /**
+     * It is not necessary to specify the wire pin, 
+     * just input the wire, because the wire has been initialized in main.cpp
+     */
     if (!PMU) {
-        PMU = new XPowersAXP2101(Wire, I2C_SDA, I2C_SCL);
+        PMU = new XPowersAXP2101(*w);
         if (!PMU->init()) {
             DEBUG_MSG("Warning: Failed to find AXP2101 power management\n");
             delete PMU;
@@ -380,7 +397,7 @@ bool Power::axpChipInit()
     }
 
     if (!PMU) {
-        PMU = new XPowersAXP192(Wire, I2C_SDA, I2C_SCL);
+        PMU = new XPowersAXP192(*w);
         if (!PMU->init()) {
             DEBUG_MSG("Warning: Failed to find AXP192 power management\n");
             delete PMU;
@@ -396,7 +413,9 @@ bool Power::axpChipInit()
         * In order not to affect other devices, if the initialization of the PMU fails, Wire needs to be re-initialized once, 
         * if there are multiple devices sharing the bus.
         * * */
-        Wire.begin(I2C_SDA, I2C_SCL);
+#ifndef PMU_USE_WIRE1
+        w->begin(I2C_SDA, I2C_SCL);
+#endif
         return false;
     }
 
@@ -436,7 +455,6 @@ bool Power::axpChipInit()
         // Set constant current charging current
         PMU->setChargerConstantCurr(XPOWERS_AXP192_CHG_CUR_450MA);
 
-    
     } else if (PMU->getChipModel() == XPOWERS_AXP2101) {
 
         // t-beam s3 core 
@@ -456,6 +474,23 @@ bool Power::axpChipInit()
         PMU->setPowerChannelVoltage(XPOWERS_DCDC3, 3300);
         PMU->enablePowerOutput(XPOWERS_DCDC3);
 
+        /**
+        * ALDO2 cannot be turned off. 
+        * It is a necessary condition for sensor communication. 
+        * It must be turned on to properly access the sensor and screen
+        * It is also responsible for the power supply of PCF8563
+        */
+        PMU->setPowerChannelVoltage(XPOWERS_ALDO2, 3300);
+        PMU->enablePowerOutput(XPOWERS_ALDO2);
+
+        // 6-axis , magnetometer ,bme280 , oled screen power channel 
+        PMU->setPowerChannelVoltage(XPOWERS_ALDO1, 3300);
+        PMU->enablePowerOutput(XPOWERS_ALDO1);
+
+        // sdcard power channle 
+        PMU->setPowerChannelVoltage(XPOWERS_BLDO1, 3300);
+        PMU->enablePowerOutput(XPOWERS_BLDO1);
+        
         // PMU->setPowerChannelVoltage(XPOWERS_DCDC4, 3300);
         // PMU->enablePowerOutput(XPOWERS_DCDC4);
 

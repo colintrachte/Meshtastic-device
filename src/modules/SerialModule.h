@@ -4,11 +4,15 @@
 #include "concurrency/OSThread.h"
 #include "configuration.h"
 #include <Arduino.h>
+#include "MeshModule.h"
+#include "Router.h"
 #include <functional>
 
 class SerialModule : private concurrency::OSThread
 {
     bool firstTime = 1;
+    unsigned long lastNmeaTime = millis();
+    char outbuf[90] = "";
 
   public:
     SerialModule();
@@ -23,16 +27,12 @@ extern SerialModule *serialModule;
  * Radio interface for SerialModule
  *
  */
-class SerialModuleRadio : public SinglePortModule
+class SerialModuleRadio : public MeshModule
 {
     uint32_t lastRxID = 0;
+    char outbuf[90] = "";
 
   public:
-    /*
-        TODO: Switch this to PortNum_SERIAL_APP once the change is able to be merged back here
-              from the main code.
-    */
-
     SerialModuleRadio();
 
     /**
@@ -48,6 +48,20 @@ class SerialModuleRadio : public SinglePortModule
     @return ProcessMessage::STOP if you've guaranteed you've handled this message and no other handlers should be considered for it
     */
     virtual ProcessMessage handleReceived(const MeshPacket &mp) override;
+
+    PortNum ourPortNum;
+
+    virtual bool wantPacket(const MeshPacket *p) override { return p->decoded.portnum == ourPortNum; }
+
+    MeshPacket *allocDataPacket()
+    {
+        // Update our local node info with our position (even if we don't decide to update anyone else)
+        MeshPacket *p = router->allocForSending();
+        p->decoded.portnum = ourPortNum;
+
+        return p;
+    }
+
 };
 
 extern SerialModuleRadio *serialModuleRadio;

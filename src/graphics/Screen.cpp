@@ -57,7 +57,6 @@ namespace graphics
 
 // This means the *visible* area (sh1106 can address 132, but shows 128 for example)
 #define IDLE_FRAMERATE 1 // in fps
-#define COMPASS_DIAM 44
 
 // DEBUG
 #define NUM_EXTRA_FRAMES 3 // text message and debug frame
@@ -85,10 +84,6 @@ static char ourId[5];
 // GeoCoord object for the screen
 GeoCoord geoCoord;
 
-// OEM Config File
-static const char *oemConfigFile = "/oem/oem.proto";
-OEMStore oemStore;
-
 #ifdef SHOW_REDRAWS
 static bool heartbeat = false;
 #endif
@@ -98,7 +93,7 @@ static uint16_t displayWidth, displayHeight;
 #define SCREEN_WIDTH displayWidth
 #define SCREEN_HEIGHT displayHeight
 
-#if defined(USE_EINK) || defined(ILI9341_DRIVER)
+#if defined(USE_EINK) || defined(ILI9341_DRIVER) || defined(ST7735_CS)
 // The screen is bigger so use bigger fonts
 #define FONT_SMALL ArialMT_Plain_16
 #define FONT_MEDIUM ArialMT_Plain_24
@@ -669,6 +664,26 @@ static bool hasPosition(NodeInfo *n)
     return n->has_position && (n->position.latitude_i != 0 || n->position.longitude_i != 0);
 }
 
+static uint16_t getCompassDiam(OLEDDisplay *display)
+{
+    uint16_t diam = 0;
+    // get the smaller of the 2 dimensions and subtract 20
+    if(display->getWidth() > display->getHeight()) {
+        diam = display->getHeight();
+        // if 2/3 of the other size would be smaller, use that
+        if (diam > (display->getWidth() * 2 / 3)) {
+            diam = display->getWidth() * 2 / 3;
+        }
+    } else {
+        diam = display->getWidth();
+        if (diam > (display->getHeight() * 2 / 3)) {
+            diam = display->getHeight() * 2 / 3;
+        }
+    }
+    
+    return diam - 20;
+};
+
 /// We will skip one node - the one for us, so we just blindly loop over all
 /// nodes
 static size_t nodeIndex;
@@ -685,7 +700,7 @@ static void drawNodeHeading(OLEDDisplay *display, int16_t compassX, int16_t comp
 
     for (int i = 0; i < 4; i++) {
         arrowPoints[i]->rotate(headingRadian);
-        arrowPoints[i]->scale(COMPASS_DIAM * 0.6);
+        arrowPoints[i]->scale(getCompassDiam(display) * 0.6);
         arrowPoints[i]->translate(compassX, compassY);
     }
     drawLine(display, tip, tail);
@@ -707,7 +722,7 @@ static void drawCompassNorth(OLEDDisplay *display, int16_t compassX, int16_t com
     for (int i = 0; i < 4; i++) {
         // North on compass will be negative of heading
         rosePoints[i]->rotate(-myHeading);
-        rosePoints[i]->scale(COMPASS_DIAM);
+        rosePoints[i]->scale(getCompassDiam(display));
         rosePoints[i]->translate(compassX, compassY);
     }
     drawLine(display, N1, N3);
@@ -772,7 +787,7 @@ static void drawNodeInfo(OLEDDisplay *display, OLEDDisplayUiState *state, int16_
     const char *fields[] = {username, distStr, signalStr, lastStr, NULL};
 
     // coordinates for the center of the compass/circle
-    int16_t compassX = x + SCREEN_WIDTH - COMPASS_DIAM / 2 - 5, compassY = y + SCREEN_HEIGHT / 2;
+    int16_t compassX = x + SCREEN_WIDTH - getCompassDiam(display) / 2 - 5, compassY = y + SCREEN_HEIGHT / 2;
     bool hasNodeHeading = false;
 
     if (ourNode && hasPosition(ourNode)) {
@@ -813,7 +828,7 @@ static void drawNodeInfo(OLEDDisplay *display, OLEDDisplayUiState *state, int16_
         // Debug info for gps lock errors
         // DEBUG_MSG("ourNode %d, ourPos %d, theirPos %d\n", !!ourNode, ourNode && hasPosition(ourNode), hasPosition(node));
         display->drawString(compassX - FONT_HEIGHT_SMALL / 4, compassY - FONT_HEIGHT_SMALL / 2, "?");
-    display->drawCircle(compassX, compassY, COMPASS_DIAM / 2);
+    display->drawCircle(compassX, compassY, getCompassDiam(display) / 2);
 
     // Must be after distStr is populated
     drawColumns(display, x, y, fields);
@@ -909,9 +924,6 @@ void Screen::setup()
     dispdev.setDetected(screen_model);
 #endif
 
-    // Load OEM config from Proto file if existent
-    loadProto(oemConfigFile, OEMStore_size, sizeof(oemConfigFile), OEMStore_fields, &oemStore);
-
     // Initialising the UI will init the display too.
     ui.init();
 
@@ -947,8 +959,12 @@ void Screen::setup()
 
 #ifdef SCREEN_MIRROR
     dispdev.mirrorScreen();
-#elif defined(SCREEN_FLIP_VERTICALLY)
-    dispdev.flipScreenVertically();
+#else
+    // Standard behaviour is to FLIP the screen (needed on T-Beam). If this config item is set, unflip it, and thereby logically flip it.
+    // If you have a headache now, you're welcome.
+    if (!config.display.flip_screen) {
+        dispdev.flipScreenVertically();
+    }
 #endif
 
     // Get our hardware ID
@@ -1374,7 +1390,6 @@ void DebugInfo::drawFrameWiFi(OLEDDisplay *display, OLEDDisplayUiState *state, i
 {
 #if HAS_WIFI
     const char *wifiName = config.network.wifi_ssid;
-    const char *wifiPsw = config.network.wifi_psk;
 
     displayedNodeNum = 0; // Not currently showing a node pane
 
@@ -1383,11 +1398,7 @@ void DebugInfo::drawFrameWiFi(OLEDDisplay *display, OLEDDisplayUiState *state, i
     // The coordinates define the left starting point of the text
     display->setTextAlignment(TEXT_ALIGN_LEFT);
 
-    if (isSoftAPForced()) {
-        display->drawString(x, y, String("WiFi: Software AP (Admin)"));
-    } else if (config.network.wifi_mode == Config_NetworkConfig_WiFiMode_ACCESS_POINT || config.network.wifi_mode == Config_NetworkConfig_WiFiMode_ACCESS_POINT_HIDDEN) {
-        display->drawString(x, y, String("WiFi: Software AP"));
-    } else if (WiFi.status() != WL_CONNECTED) {
+    if (WiFi.status() != WL_CONNECTED) {
         display->drawString(x, y, String("WiFi: Not Connected"));
     } else {
         display->drawString(x, y, String("WiFi: Connected"));
@@ -1408,25 +1419,14 @@ void DebugInfo::drawFrameWiFi(OLEDDisplay *display, OLEDDisplayUiState *state, i
     - WL_NO_SHIELD: assigned when no WiFi shield is present;
 
     */
-    if (WiFi.status() == WL_CONNECTED || isSoftAPForced() || config.network.wifi_mode == Config_NetworkConfig_WiFiMode_ACCESS_POINT || config.network.wifi_mode == Config_NetworkConfig_WiFiMode_ACCESS_POINT_HIDDEN) {
-        if (config.network.wifi_mode == Config_NetworkConfig_WiFiMode_ACCESS_POINT || config.network.wifi_mode == Config_NetworkConfig_WiFiMode_ACCESS_POINT_HIDDEN || isSoftAPForced()) {
-            display->drawString(x, y + FONT_HEIGHT_SMALL * 1, "IP: " + String(WiFi.softAPIP().toString().c_str()));
-
-            // Number of connections to the AP. Default max for the esp32 is 4
-            display->drawString(x + SCREEN_WIDTH - display->getStringWidth("(" + String(WiFi.softAPgetStationNum()) + "/4)"),
-                                y + FONT_HEIGHT_SMALL * 1, "(" + String(WiFi.softAPgetStationNum()) + "/4)");
-        } else {
-            display->drawString(x, y + FONT_HEIGHT_SMALL * 1, "IP: " + String(WiFi.localIP().toString().c_str()));
-        }
-
+    if (WiFi.status() == WL_CONNECTED) {
+        display->drawString(x, y + FONT_HEIGHT_SMALL * 1, "IP: " + String(WiFi.localIP().toString().c_str()));
     } else if (WiFi.status() == WL_NO_SSID_AVAIL) {
         display->drawString(x, y + FONT_HEIGHT_SMALL * 1, "SSID Not Found");
     } else if (WiFi.status() == WL_CONNECTION_LOST) {
         display->drawString(x, y + FONT_HEIGHT_SMALL * 1, "Connection Lost");
     } else if (WiFi.status() == WL_CONNECT_FAILED) {
         display->drawString(x, y + FONT_HEIGHT_SMALL * 1, "Connection Failed");
-        //} else if (WiFi.status() == WL_DISCONNECTED) {
-        //    display->drawString(x, y + FONT_HEIGHT_SMALL * 1, "Disconnected");
     } else if (WiFi.status() == WL_IDLE_STATUS) {
         display->drawString(x, y + FONT_HEIGHT_SMALL * 1, "Idle ... Reconnecting");
     } else {
@@ -1493,24 +1493,8 @@ void DebugInfo::drawFrameWiFi(OLEDDisplay *display, OLEDDisplayUiState *state, i
         }
     }
 
-    if (isSoftAPForced()) {
-        if ((millis() / 10000) % 2) {
-            display->drawString(x, y + FONT_HEIGHT_SMALL * 2, "SSID: meshtasticAdmin");
-        } else {
-            display->drawString(x, y + FONT_HEIGHT_SMALL * 2, "PWD: 12345678");
-        }
+    display->drawString(x, y + FONT_HEIGHT_SMALL * 2, "SSID: " + String(wifiName));
 
-    } else {
-        if (config.network.wifi_mode== Config_NetworkConfig_WiFiMode_ACCESS_POINT || config.network.wifi_mode == Config_NetworkConfig_WiFiMode_ACCESS_POINT_HIDDEN) {
-            if ((millis() / 10000) % 2) {
-                display->drawString(x, y + FONT_HEIGHT_SMALL * 2, "SSID: " + String(wifiName));
-            } else {
-                display->drawString(x, y + FONT_HEIGHT_SMALL * 2, "PWD: " + String(wifiPsw));
-            }
-        } else {
-            display->drawString(x, y + FONT_HEIGHT_SMALL * 2, "SSID: " + String(wifiName));
-        }
-    }
     display->drawString(x, y + FONT_HEIGHT_SMALL * 3, "http://meshtastic.local");
 
     /* Display a heartbeat pixel that blinks every time the frame is redrawn */
@@ -1642,6 +1626,9 @@ void DebugInfo::drawFrameSettings(OLEDDisplay *display, OLEDDisplayUiState *stat
 // adjust Brightness cycle trough 1 to 254 as long as attachDuringLongPress is true
 void Screen::adjustBrightness()
 {
+    if (!useDisplay)
+        return;
+
     if (brightness == 254) {
         brightness = 0;
     } else {
